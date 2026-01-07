@@ -16,14 +16,48 @@ Tofu Controller offers many GitOps models:
   3. **State Enforcement Model:** You have a TFSTATE file, and you'd like to use GitOps enforce it, without changing anything else.
   4. **Drift Detection Model:** You have a TFSTATE file, and you'd like to use GitOps just for drift detection, so you can decide to do things later when a drift occurs.
 
-## Get in touch
+# Fork Information
 
-If you have a feature request to share or a bug to report, please file an issue.
+This is a personal fork of [flux-iac/tofu-controller](https://github.com/flux-iac/tofu-controller) maintained by João Leão.
 
-You can also reach out via our [Tofu Controller Slack channel](https://cloud-native.slack.com/messages/tofu-controller) — get there by first joining the [CNCF Slack space](https://slack.cncf.io/).
+**Original Project:** [flux-iac/tofu-controller](https://github.com/flux-iac/tofu-controller)
 
-## Quickstart and documentation
+## Purpose
 
-To get started check out this [guide](https://flux-iac.github.io/tofu-controller/getting_started/) on how to GitOps your Terraform resources with Tofu Controller and Flux.
+This fork adds **hybrid plan storage** capabilities to handle Terraform plans that exceed Kubernetes Secret size limits (1MB).
 
-Check out the [documentation](https://flux-iac.github.io/tofu-controller/) and [use cases](https://flux-iac.github.io/tofu-controller/use-tf-controller/).
+## Key Features
+
+### Hybrid Storage Strategy
+
+The controller automatically selects the optimal storage strategy based on plan size:
+
+1. **Chunked Secrets (< 900KB)**: Plans split into multiple 1MB secret chunks
+2. **Ephemeral Volumes (≥ 900KB)**: Plans stored in pod-local ephemeral volumes
+3. **Legacy Single Secret**: Backward compatible with existing deployments
+
+## Benefits
+
+- ✅ Unlimited plan size via volume storage
+- ✅ Backward compatible with existing deployments
+- ✅ Efficient - small plans use secrets, large plans use volumes
+- ✅ Auto-cleanup - no orphaned plan data
+- ✅ Production tested in enterprise environments
+
+## Installation
+
+Refer to the [upstream documentation](https://github.com/flux-iac/tofu-controller) for installation instructions. This fork maintains compatibility with the standard installation process.
+
+## Documentation
+
+For comprehensive documentation, please visit the [upstream project documentation](https://flux-iac.github.io/tofu-controller/).
+
+## License
+
+Apache License 2.0
+
+## Contact
+
+- **LinkedIn:** [linkedin.com/in/joaoleao7](https://linkedin.com/in/joaoleao7)
+- **Original Project:** [flux-iac/tofu-controller](https://github.com/flux-iac/tofu-controller)
+
