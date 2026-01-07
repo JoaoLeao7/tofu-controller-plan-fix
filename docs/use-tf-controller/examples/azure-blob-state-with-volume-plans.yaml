@@ -249,32 +249,3 @@ spec:
   
   # Enable drift detection for production
   disableDriftDetection: false
-
----
-# BENEFITS OF THIS SETUP:
-#
-# ✅ STATE in Azure Blob Storage:
-#    - Durable and persistent
-#    - Versioned (Azure Blob versioning)
-#    - Encrypted at rest
-#    - No size limits
-#    - Team access via Azure RBAC
-#    - Disaster recovery ready
-#    - Compliant with enterprise policies
-#
-# ✅ PLANS in Chunked Secrets (< 900KB) or Ephemeral Volumes (> 900KB):
-#    - Small plans: Multiple 1MB secret chunks (unlimited number of chunks)
-#    - Large plans: Ephemeral volume storage (truly unlimited)
-#    - Auto-fallback handles the decision automatically
-#    - Fast local storage for large plans
-#    - Auto-cleanup (no orphaned data)
-#    - No cloud storage costs for temporary data
-#    - Requires alwaysCleanupRunnerPod: false for volume storage (same pod for plan & apply)
-#
-# ✅ WORKFLOW:
-#    1. terraform plan → Large plan file (2MB) → Ephemeral volume ✅
-#    2. Review plan → Read from volume
-#    3. terraform apply → Reads plan from volume
-#    4. State saved → Azure Blob Storage ✅
-#    5. Pod terminates → Volume cleaned up automatically ✅
-#    6. State persists → In Azure Blob forever ✅
