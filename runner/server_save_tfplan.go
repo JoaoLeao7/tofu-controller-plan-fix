@@ -7,22 +7,23 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/flux-iac/tofu-controller/api/plan"
 	"github.com/flux-iac/tofu-controller/api/planid"
+	infrav1 "github.com/flux-iac/tofu-controller/api/v1alpha2"
+	"github.com/flux-iac/tofu-controller/utils"
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func (r *TerraformRunnerServer) SaveTFPlan(ctx context.Context, req *SaveTFPlanRequest) (*SaveTFPlanReply, error) {
 	log := ctrl.LoggerFrom(ctx, "instance-id", r.InstanceID).WithName(loggerName)
 	log.Info("save the plan")
-
-	if err := r.ValidateInstanceID(req.TfInstance); err != nil {
-		log.Error(err, "terraform session mismatch when saving the plan")
-
+	if req.TfInstance != r.InstanceID {
+		err := fmt.Errorf("no TF instance found")
+		log.Error(err, "no terraform")
 		return nil, err
 	}
 
@@ -42,55 +43,36 @@ func (r *TerraformRunnerServer) SaveTFPlan(ctx context.Context, req *SaveTFPlanR
 	// planid must be the short plan id format
 	planId := planid.GetPlanID(req.Revision)
 
-	// Create the Plan object
-	tfPlan, err := plan.NewFromBytes(req.Name, req.Namespace, r.terraform.WorkspaceName(), req.Uuid, planId, tfplan)
-	if err != nil {
+	// Use the new storage manager
+	sm := NewStorageManager(r.Client, r.terraform, log)
+	if err := sm.WriteTFPlan(ctx, req.Name, req.Namespace, planId, "", req.Uuid, tfplan); err != nil {
 		return nil, err
 	}
 
-	if err := r.writePlanAsSecret(ctx, req.Name, req.Namespace, log, planId, tfPlan, "", req.Uuid); err != nil {
-		return nil, err
-	}
-
-	switch r.terraform.Spec.StoreReadablePlan {
-	case "json":
+	if r.terraform.Spec.StoreReadablePlan == "json" {
 		planObj, err := r.tfShowPlanFile(ctx, TFPlanName)
 		if err != nil {
 			log.Error(err, "unable to get the plan output for json")
 			return nil, err
 		}
-
 		jsonBytes, err := json.Marshal(planObj)
 		if err != nil {
 			log.Error(err, "unable to marshal the plan to json")
 			return nil, err
 		}
 
-		jsonPlan, err := plan.NewFromBytes(req.Name, req.Namespace, r.terraform.WorkspaceName(), req.Uuid, planId, jsonBytes)
-		if err != nil {
-			log.Error(err, "Unable to create plan")
+		if err := sm.WriteTFPlan(ctx, req.Name, req.Namespace, planId, ".json", req.Uuid, jsonBytes); err != nil {
 			return nil, err
 		}
 
-		if err := r.writePlanAsSecret(ctx, req.Name, req.Namespace, log, planId, jsonPlan, ".json", req.Uuid); err != nil {
-			log.Error(err, "unable to write the plan to secret")
-			return nil, err
-		}
-	case "human":
+	} else if r.terraform.Spec.StoreReadablePlan == "human" {
 		rawOutput, err := r.tfShowPlanFileRaw(ctx, TFPlanName)
 		if err != nil {
 			log.Error(err, "unable to get the plan output for human")
 			return nil, err
 		}
 
-		rawPlan, err := plan.NewFromBytes(req.Name, req.Namespace, r.terraform.WorkspaceName(), req.Uuid, planId, []byte(rawOutput))
-		if err != nil {
-			log.Error(err, "Unable to create plan")
-			return nil, err
-		}
-
-		if err := r.writePlanAsConfigMap(ctx, req.Name, req.Namespace, log, planId, rawPlan, "", req.Uuid); err != nil {
-			log.Error(err, "unable to write the plan to configmap")
+		if err := r.writePlanAsConfigMap(ctx, req.Name, req.Namespace, log, planId, rawOutput, "", req.Uuid); err != nil {
 			return nil, err
 		}
 	}
@@ -98,103 +80,123 @@ func (r *TerraformRunnerServer) SaveTFPlan(ctx context.Context, req *SaveTFPlanR
 	return &SaveTFPlanReply{Message: "ok"}, nil
 }
 
-func (r *TerraformRunnerServer) writePlanAsSecret(ctx context.Context, name string, namespace string, log logr.Logger, planId string, plan *plan.Plan, suffix string, uuid string) error {
-	existingSecrets := &v1.SecretList{}
+func (r *TerraformRunnerServer) writePlanAsSecret(ctx context.Context, name string, namespace string, log logr.Logger, planId string, tfplan []byte, suffix string, uuid string) error {
+	secretName := "tfplan-" + r.terraform.WorkspaceName() + "-" + name + suffix
+	tfplanObjectKey := types.NamespacedName{Name: secretName, Namespace: namespace}
+	var tfplanSecret v1.Secret
+	tfplanSecretExists := true
 
-	// Try to get any secrets by using the plan labels
-	// This covers "chunked" secrets as well as a single secret
-	if err := r.Client.List(ctx, existingSecrets, client.InNamespace(namespace), client.MatchingLabels{
-		"infra.contrib.fluxcd.io/plan-name":      name + suffix,
-		"infra.contrib.fluxcd.io/plan-workspace": r.terraform.WorkspaceName(),
-	}); err != nil {
-		log.Error(err, "unable to list existing plan secrets")
-		return err
-	}
-
-	// Check for a legacy secret if none found with the
-	// new labels
-	if len(existingSecrets.Items) == 0 {
-		var legacyPlanSecret v1.Secret
-
-		if err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "tfplan-" + r.terraform.WorkspaceName() + "-" + name + suffix}, &legacyPlanSecret); err == nil {
-			existingSecrets.Items = append(existingSecrets.Items, legacyPlanSecret)
-		}
-	}
-
-	// Clear up any of the old secrets first
-	for _, s := range existingSecrets.Items {
-		if err := r.Client.Delete(ctx, &s); err != nil {
-			log.Error(err, "unable to delete existing plan secret", "secretName", s.Name)
+	if err := r.Client.Get(ctx, tfplanObjectKey, &tfplanSecret); err != nil {
+		if errors.IsNotFound(err) {
+			tfplanSecretExists = false
+		} else {
+			err = fmt.Errorf("error getting tfplanSecret: %s", err)
+			log.Error(err, "unable to get the plan secret")
 			return err
 		}
 	}
 
-	secrets, err := plan.ToSecret(suffix)
+	if tfplanSecretExists {
+		if err := r.Client.Delete(ctx, &tfplanSecret); err != nil {
+			err = fmt.Errorf("error deleting tfplanSecret: %s", err)
+			log.Error(err, "unable to delete the plan secret")
+			return err
+		}
+	}
+
+	tfplan, err := utils.GzipEncode(tfplan)
 	if err != nil {
-		log.Error(err, "unable to generate plan secrets", "planId", planId)
+		log.Error(err, "unable to encode the plan revision", "planId", planId)
 		return err
 	}
 
-	// We shouldn't have to check whether any of these already exist, as we've done
-	// that above
-	for _, secret := range secrets {
-		// now create the seecret
-		if err := r.Client.Create(ctx, secret); err != nil {
-			err = fmt.Errorf("error recording plan status: %s", err)
-			log.Error(err, "unable to create plan secret")
-			return err
-		}
+	tfplanData := map[string][]byte{TFPlanName: tfplan}
+	tfplanSecret = v1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Secret",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				"encoding":                "gzip",
+				SavedPlanSecretAnnotation: planId,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: infrav1.GroupVersion.Group + "/" + infrav1.GroupVersion.Version,
+					Kind:       infrav1.TerraformKind,
+					Name:       name,
+					UID:        types.UID(uuid),
+				},
+			},
+		},
+		Type: v1.SecretTypeOpaque,
+		Data: tfplanData,
+	}
+
+	if err := r.Client.Create(ctx, &tfplanSecret); err != nil {
+		err = fmt.Errorf("error recording plan status: %s", err)
+		log.Error(err, "unable to create plan secret")
+		return err
 	}
 
 	return nil
 }
 
-func (r *TerraformRunnerServer) writePlanAsConfigMap(ctx context.Context, name string, namespace string, log logr.Logger, planId string, plan *plan.Plan, suffix string, uuid string) error {
-	existingConfigMaps := &v1.ConfigMapList{}
+func (r *TerraformRunnerServer) writePlanAsConfigMap(ctx context.Context, name string, namespace string, log logr.Logger, planId string, tfplan string, suffix string, uuid string) error {
+	configMapName := "tfplan-" + r.terraform.WorkspaceName() + "-" + name + suffix
+	tfplanObjectKey := types.NamespacedName{Name: configMapName, Namespace: namespace}
+	var tfplanCM v1.ConfigMap
+	tfplanCMExists := true
 
-	// Try to get any ConfigMaps by using the plan labels
-	// This covers "chunked" ConfigMaps as well as a single ConfigMap
-	if err := r.Client.List(ctx, existingConfigMaps, client.InNamespace(namespace), client.MatchingLabels{
-		"infra.contrib.fluxcd.io/plan-name":      name + suffix,
-		"infra.contrib.fluxcd.io/plan-workspace": r.terraform.WorkspaceName(),
-	}); err != nil {
-		log.Error(err, "unable to list existing plan ConfigMaps")
-		return err
-	}
-
-	// Check for a legacy configmap if none found with the
-	// new labels
-	if len(existingConfigMaps.Items) == 0 {
-		var legacyPlanConfigMap v1.ConfigMap
-
-		if err := r.Client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: "tfplan-" + r.terraform.WorkspaceName() + "-" + name + suffix}, &legacyPlanConfigMap); err == nil {
-			existingConfigMaps.Items = append(existingConfigMaps.Items, legacyPlanConfigMap)
-		}
-	}
-
-	// Clear up any of the old ConfigMaps first
-	for _, s := range existingConfigMaps.Items {
-		if err := r.Client.Delete(ctx, &s); err != nil {
-			log.Error(err, "unable to delete existing plan ConfigMap", "configMapName", s.Name)
+	if err := r.Client.Get(ctx, tfplanObjectKey, &tfplanCM); err != nil {
+		if errors.IsNotFound(err) {
+			tfplanCMExists = false
+		} else {
+			err = fmt.Errorf("error getting tfplanSecret: %s", err)
+			log.Error(err, "unable to get the plan configmap")
 			return err
 		}
 	}
 
-	configMaps, err := plan.ToConfigMap(suffix)
-	if err != nil {
-		log.Error(err, "unable to generate plan ConfigMaps", "planId", planId)
-		return err
-	}
-
-	// We shouldn't have to check whether any of these already exist, as we've done
-	// that above
-	for _, configmap := range configMaps {
-		// now create the configmap
-		if err := r.Client.Create(ctx, configmap); err != nil {
-			err = fmt.Errorf("error recording plan status: %s", err)
-			log.Error(err, "unable to create plan ConfigMap")
+	if tfplanCMExists {
+		if err := r.Client.Delete(ctx, &tfplanCM); err != nil {
+			err = fmt.Errorf("error deleting tfplanSecret: %s", err)
+			log.Error(err, "unable to delete the plan configmap")
 			return err
 		}
+	}
+
+	tfplanData := map[string]string{TFPlanName: tfplan}
+	tfplanCM = v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				SavedPlanSecretAnnotation: planId,
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: infrav1.GroupVersion.Group + "/" + infrav1.GroupVersion.Version,
+					Kind:       infrav1.TerraformKind,
+					Name:       name,
+					UID:        types.UID(uuid),
+				},
+			},
+		},
+		Data: tfplanData,
+	}
+
+	if err := r.Client.Create(ctx, &tfplanCM); err != nil {
+		err = fmt.Errorf("error recording plan status: %s", err)
+		log.Error(err, "unable to create plan configmap")
+		return err
 	}
 
 	return nil

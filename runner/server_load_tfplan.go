@@ -8,20 +8,20 @@ import (
 	"github.com/go-logr/logr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/flux-iac/tofu-controller/api/plan"
 	infrav1 "github.com/flux-iac/tofu-controller/api/v1alpha2"
 	"github.com/spf13/afero"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func (r *TerraformRunnerServer) LoadTFPlan(ctx context.Context, req *LoadTFPlanRequest) (*LoadTFPlanReply, error) {
 	log := ctrl.LoggerFrom(ctx, "instance-id", r.InstanceID).WithName(loggerName)
-	log.Info("loading plan from secret")
+	log.Info("loading plan")
 
-	if err := r.ValidateInstanceID(req.TfInstance); err != nil {
-		log.Error(err, "terraform session mismatch when loading the plan")
-
+	if req.TfInstance != r.InstanceID {
+		err := fmt.Errorf("no TF instance found")
+		log.Error(err, "no terraform")
 		return nil, err
 	}
 
@@ -29,54 +29,54 @@ func (r *TerraformRunnerServer) LoadTFPlan(ctx context.Context, req *LoadTFPlanR
 	return loadTFPlan(ctx, log, req, r.terraform, r.tf.WorkingDir(), r.Client, fs)
 }
 
-// loadTFPlan loads the plan from the secret and returns the plan as a reply.
+// loadTFPlan loads the plan from storage (secret or volume) and returns the plan as a reply.
 func loadTFPlan(
 	ctx context.Context,
 	log logr.Logger,
 	req *LoadTFPlanRequest,
 	terraform *infrav1.Terraform,
 	workingDir string,
-	kubeClient client.Client,
+	client client.Client,
 	fs afero.Fs,
 ) (*LoadTFPlanReply, error) {
-	if !req.BackendCompletelyDisable {
-		secrets := &v1.SecretList{}
+	// Use StorageManager to handle both secret and volume storage
+	storageManager := NewStorageManager(client, terraform, log)
 
-		// List relevant secrets
-		if err := kubeClient.List(ctx, secrets, client.InNamespace(req.Namespace), client.MatchingLabels{
-			"infra.contrib.fluxcd.io/plan-name":      req.Name,
-			"infra.contrib.fluxcd.io/plan-workspace": terraform.WorkspaceName(),
-		}); err != nil {
-			log.Error(err, "unable to list existing plan secrets")
-			return nil, err
-		}
+	tfplanSecretKey := types.NamespacedName{Namespace: req.Namespace, Name: "tfplan-" + terraform.WorkspaceName() + "-" + req.Name}
+	tfplanSecret := corev1.Secret{}
+	err := client.Get(ctx, tfplanSecretKey, &tfplanSecret)
+	if err != nil {
+		err = fmt.Errorf("error getting plan secret: %s", err)
+		log.Error(err, "unable to get secret")
+		return nil, err
+	}
 
-		// Check that we actually have some secrets to read
-		if len(secrets.Items) == 0 {
-			err := fmt.Errorf("no plan secrets found for plan %s", req.PendingPlan)
-			log.Error(err, "no plan secret found")
-			return nil, err
-		}
-
+	if terraform.Spec.Force {
+		// skip the annotation check
+		log.Info("force mode, skipping the plan's annotation check")
+	} else {
+		// this must be the short plan format: see api/planid/plan_id.go
 		pendingPlanId := req.PendingPlan
-
-		for _, s := range secrets.Items {
-			if terraform.Spec.Force {
-				continue
-			}
-
-			if s.Annotations[plan.SavedPlanSecretAnnotation] != pendingPlanId {
-				return nil, fmt.Errorf("pending plan %s does not match secret %s (%s)", pendingPlanId, s.Name, s.Annotations[plan.SavedPlanSecretAnnotation])
-			}
+		if tfplanSecret.Annotations[SavedPlanSecretAnnotation] != pendingPlanId {
+			err = fmt.Errorf("error pending plan and plan's name in the secret are not matched: %s != %s",
+				pendingPlanId,
+				tfplanSecret.Annotations[SavedPlanSecretAnnotation])
+			log.Error(err, "plan name mismatch")
+			return nil, err
 		}
+	}
 
-		tfPlan, err := plan.NewFromSecrets(req.Name, req.Namespace, string(terraform.GetUID()), secrets.Items)
+	if req.BackendCompletelyDisable {
+		// do nothing
+	} else {
+		// Use StorageManager to read plan (handles both secret and volume storage)
+		tfplan, err := storageManager.ReadTFPlan(ctx, req.Name, req.Namespace, "")
 		if err != nil {
-			log.Error(err, "unable to reconstruct plan from secrets")
+			log.Error(err, "unable to read the plan")
 			return nil, err
 		}
 
-		err = afero.WriteFile(fs, filepath.Join(workingDir, TFPlanName), tfPlan.Bytes(), 0644)
+		err = afero.WriteFile(fs, filepath.Join(workingDir, TFPlanName), tfplan, 0644)
 		if err != nil {
 			err = fmt.Errorf("error saving plan file to disk: %s", err)
 			log.Error(err, "unable to write the plan to disk")

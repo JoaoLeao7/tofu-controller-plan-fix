@@ -229,6 +229,10 @@ type TerraformSpec struct {
 	// +optional
 	RunnerTerminationGracePeriodSeconds *int64 `json:"runnerTerminationGracePeriodSeconds,omitempty"`
 
+	// StorageConfig configures where and how to store Terraform state and plan files.
+	// +optional
+	StorageConfig *StorageConfigSpec `json:"storageConfig,omitempty"`
+
 	// UpgradeOnInit configures to upgrade modules and providers on initialization of a stack
 	// +kubebuilder:default:=true
 	// +optional
@@ -490,6 +494,46 @@ type BackendConfigSpec struct {
 
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
+}
+
+// StorageType defines the type of storage to use for tfstate and tfplan files
+// +kubebuilder:validation:Enum=secret;volume
+type StorageType string
+
+const (
+	// StorageTypeSecret stores data in Kubernetes secrets (default, limited to 1MB)
+	StorageTypeSecret StorageType = "secret"
+	// StorageTypeVolume stores data in an ephemeral volume (unlimited size, cleared on pod restart)
+	StorageTypeVolume StorageType = "volume"
+)
+
+// StorageConfigSpec configures where and how to store Terraform state and plan files
+type StorageConfigSpec struct {
+	// Type specifies the storage type to use for tfstate and tfplan files.
+	// Defaults to "secret" for backward compatibility.
+	// +kubebuilder:default:=secret
+	// +kubebuilder:validation:Enum=secret;volume
+	// +optional
+	Type StorageType `json:"type,omitempty"`
+
+	// MaxSecretSize sets the maximum size (in bytes) for secrets before falling back
+	// to volume storage. Defaults to 900000 (900KB) to stay under the 1MB limit.
+	// Only applies when Type is "secret".
+	// +kubebuilder:default:=900000
+	// +optional
+	MaxSecretSize *int64 `json:"maxSecretSize,omitempty"`
+
+	// AutoFallback enables automatic fallback to volume storage when
+	// secrets exceed MaxSecretSize.
+	// +kubebuilder:default:=false
+	// +optional
+	AutoFallback bool `json:"autoFallback,omitempty"`
+
+	// VolumeMountPath specifies where to mount the ephemeral volume in the runner pod.
+	// Only applies when Type is "volume" or when AutoFallback is enabled.
+	// +kubebuilder:default:="/tmp/tf-storage"
+	// +optional
+	VolumeMountPath string `json:"volumeMountPath,omitempty"`
 }
 
 // TFStateSpec allows the user to set ForceUnlock
