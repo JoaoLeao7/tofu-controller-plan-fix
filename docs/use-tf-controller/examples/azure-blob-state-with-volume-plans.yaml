@@ -1,0 +1,280 @@
+---
+# Azure Blob Storage for State + Ephemeral Volume for Plans
+# This is the recommended production configuration
+
+apiVersion: v1
+kind: Secret
+metadata:
+  name: azure-storage-credentials
+  namespace: flux-system
+type: Opaque
+stringData:
+  # Azure Storage Account credentials
+  ARM_ACCESS_KEY: "<your-storage-account-key>"
+  # Or use Service Principal:
+  # ARM_CLIENT_ID: "<your-client-id>"
+  # ARM_CLIENT_SECRET: "<your-client-secret>"
+  # ARM_TENANT_ID: "<your-tenant-id>"
+  # ARM_SUBSCRIPTION_ID: "<your-subscription-id>"
+
+---
+apiVersion: infra.contrib.fluxcd.io/v1alpha2
+kind: Terraform
+metadata:
+  name: my-infrastructure
+  namespace: flux-system
+spec:
+  approvePlan: auto
+  interval: 10m
+  path: ./terraform
+  sourceRef:
+    kind: GitRepository
+    name: my-repo
+  
+  # ✅ STATE: Store in Azure Blob Storage
+  backendConfig:
+    customConfiguration: |
+      backend "azurerm" {
+        resource_group_name  = "terraform-state-rg"
+        storage_account_name = "tfstatestorage"
+        container_name       = "tfstate"
+        key                  = "production/terraform.tfstate"
+      }
+  
+  # Load Azure credentials from secret
+  backendConfigsFrom:
+    - kind: Secret
+      name: azure-storage-credentials
+  
+  # ✅ PLANS: Store in ephemeral volumes (unlimited size)
+  storageConfig:
+    type: volume
+    volumeMountPath: "/tmp/tf-storage"
+  
+  # IMPORTANT: Must keep runner pod alive for volume storage to work
+  alwaysCleanupRunnerPod: false
+  
+  # Optional: Enable drift detection
+  disableDriftDetection: false
+
+---
+# Example 2: Auto-fallback for plans (starts with secrets, switches to volume if needed)
+apiVersion: infra.contrib.fluxcd.io/v1alpha2
+kind: Terraform
+metadata:
+  name: my-infrastructure-auto
+  namespace: flux-system
+spec:
+  approvePlan: auto
+  interval: 10m
+  path: ./terraform
+  sourceRef:
+    kind: GitRepository
+    name: my-repo
+  
+  # ✅ STATE: Azure Blob Storage
+  backendConfig:
+    customConfiguration: |
+      backend "azurerm" {
+        resource_group_name  = "terraform-state-rg"
+        storage_account_name = "tfstatestorage"
+        container_name       = "tfstate"
+        key                  = "production/terraform.tfstate"
+      }
+  
+  backendConfigsFrom:
+    - kind: Secret
+      name: azure-storage-credentials
+  
+  # ✅ PLANS: Auto-fallback (small plans in secrets, large plans in volumes)
+  storageConfig:
+    type: secret              # Start with secrets for small plans
+    autoFallback: true        # Switch to volume for large plans
+    maxSecretSize: 900000     # 900KB threshold
+    volumeMountPath: "/tmp/tf-storage"
+  
+  # IMPORTANT: Must keep runner pod alive when using volume fallback
+  alwaysCleanupRunnerPod: false
+
+---
+# Example 3: With Workload Identity (no secrets needed)
+apiVersion: infra.contrib.fluxcd.io/v1alpha2
+kind: Terraform
+metadata:
+  name: my-infrastructure-workload-identity
+  namespace: flux-system
+spec:
+  approvePlan: auto
+  interval: 10m
+  path: ./terraform
+  sourceRef:
+    kind: GitRepository
+    name: my-repo
+  
+  # ✅ STATE: Azure Blob with Workload Identity
+  backendConfig:
+    customConfiguration: |
+      backend "azurerm" {
+        resource_group_name  = "terraform-state-rg"
+        storage_account_name = "tfstatestorage"
+        container_name       = "tfstate"
+        key                  = "production/terraform.tfstate"
+        use_oidc            = true
+      }
+  
+  # ✅ PLANS: Ephemeral volumes
+  storageConfig:
+    type: volume
+    volumeMountPath: "/tmp/tf-storage"
+  
+  # IMPORTANT: Must keep runner pod alive for volume storage
+  alwaysCleanupRunnerPod: false
+  
+  # Use service account with workload identity
+  serviceAccountName: terraform-runner
+
+---
+# Example 4: Multiple environments with same pattern
+apiVersion: infra.contrib.fluxcd.io/v1alpha2
+kind: Terraform
+metadata:
+  name: dev-infrastructure
+  namespace: dev
+spec:
+  approvePlan: auto
+  interval: 5m
+  path: ./environments/dev
+  sourceRef:
+    kind: GitRepository
+    name: infrastructure
+  
+  # ✅ STATE: Azure Blob (dev container)
+  backendConfig:
+    customConfiguration: |
+      backend "azurerm" {
+        resource_group_name  = "terraform-state-rg"
+        storage_account_name = "tfstatestorage"
+        container_name       = "tfstate"
+        key                  = "dev/terraform.tfstate"
+      }
+  
+  backendConfigsFrom:
+    - kind: Secret
+      name: azure-storage-credentials
+      namespace: flux-system
+  
+  # ✅ PLANS: Ephemeral volumes
+  storageConfig:
+    type: volume
+    volumeMountPath: "/tmp/tf-storage"
+  
+  # IMPORTANT: Must keep runner pod alive for volume storage
+  alwaysCleanupRunnerPod: false
+
+---
+apiVersion: infra.contrib.fluxcd.io/v1alpha2
+kind: Terraform
+metadata:
+  name: staging-infrastructure
+  namespace: staging
+spec:
+  approvePlan: auto
+  interval: 10m
+  path: ./environments/staging
+  sourceRef:
+    kind: GitRepository
+    name: infrastructure
+  
+  # ✅ STATE: Azure Blob (staging container)
+  backendConfig:
+    customConfiguration: |
+      backend "azurerm" {
+        resource_group_name  = "terraform-state-rg"
+        storage_account_name = "tfstatestorage"
+        container_name       = "tfstate"
+        key                  = "staging/terraform.tfstate"
+      }
+  
+  backendConfigsFrom:
+    - kind: Secret
+      name: azure-storage-credentials
+      namespace: flux-system
+  
+  # ✅ PLANS: Auto-fallback
+  storageConfig:
+    type: secret
+    autoFallback: true
+    maxSecretSize: 900000
+    volumeMountPath: "/tmp/tf-storage"
+  
+  # IMPORTANT: Must keep runner pod alive when using volume fallback
+  alwaysCleanupRunnerPod: false
+
+---
+apiVersion: infra.contrib.fluxcd.io/v1alpha2
+kind: Terraform
+metadata:
+  name: prod-infrastructure
+  namespace: prod
+spec:
+  approvePlan: plan-and-manually-approve  # Manual approval for prod
+  interval: 30m
+  path: ./environments/prod
+  sourceRef:
+    kind: GitRepository
+    name: infrastructure
+  
+  # ✅ STATE: Azure Blob (prod container)
+  backendConfig:
+    customConfiguration: |
+      backend "azurerm" {
+        resource_group_name  = "terraform-state-rg"
+        storage_account_name = "tfstatestorage"
+        container_name       = "tfstate"
+        key                  = "prod/terraform.tfstate"
+      }
+  
+  backendConfigsFrom:
+    - kind: Secret
+      name: azure-storage-credentials
+      namespace: flux-system
+  
+  # ✅ PLANS: Ephemeral volumes (always use volumes for prod)
+  storageConfig:
+    type: volume
+    volumeMountPath: "/tmp/tf-storage"
+  
+  # IMPORTANT: Must keep runner pod alive for volume storage
+  alwaysCleanupRunnerPod: false
+  
+  # Enable drift detection for production
+  disableDriftDetection: false
+
+---
+# BENEFITS OF THIS SETUP:
+#
+# ✅ STATE in Azure Blob Storage:
+#    - Durable and persistent
+#    - Versioned (Azure Blob versioning)
+#    - Encrypted at rest
+#    - No size limits
+#    - Team access via Azure RBAC
+#    - Disaster recovery ready
+#    - Compliant with enterprise policies
+#
+# ✅ PLANS in Chunked Secrets (< 900KB) or Ephemeral Volumes (> 900KB):
+#    - Small plans: Multiple 1MB secret chunks (unlimited number of chunks)
+#    - Large plans: Ephemeral volume storage (truly unlimited)
+#    - Auto-fallback handles the decision automatically
+#    - Fast local storage for large plans
+#    - Auto-cleanup (no orphaned data)
+#    - No cloud storage costs for temporary data
+#    - Requires alwaysCleanupRunnerPod: false for volume storage (same pod for plan & apply)
+#
+# ✅ WORKFLOW:
+#    1. terraform plan → Large plan file (2MB) → Ephemeral volume ✅
+#    2. Review plan → Read from volume
+#    3. terraform apply → Reads plan from volume
+#    4. State saved → Azure Blob Storage ✅
+#    5. Pod terminates → Volume cleaned up automatically ✅
+#    6. State persists → In Azure Blob forever ✅
